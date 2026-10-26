@@ -1,0 +1,191 @@
+"""Data layer for the Karandaaz Treasury dashboard.
+
+Reads the treasury workbook (e.g. "26-27 GF Balance as of 5th October 2026.xlsx")
+and returns clean tables. Replace the Excel file and the dashboard updates.
+"""
+from __future__ import annotations
+
+import datetime as dt
+from dataclasses import dataclass, field
+
+import openpyxl
+import pandas as pd
+
+PROGRAMMES = [
+    "Financial Inclusion Programme", "Ehsaas", "Cash Transfer Programme",
+    "G2P Digitisation Programme", "Cash in Cash Out (CICO)",
+    "Raast Regional Connectivity", "FBR Digitalisation",
+]
+CODES = ["INV-007619", "INV-032192", "INV-061756", "INV-087029",
+         "INV-087089", "INV-086432", "INV-102619"]
+PROG_MAP = {
+    "financial inclusion program": 0, "ehsaas program": 1, "cash transfer program": 2,
+    "g2p digitization program": 3, "cash in cash out (cico)": 4,
+    "raast regional connectivity": 5, "fbr digitalization": 6,
+}
+# programme columns in the "26-27 Detailed" sheet (F = Mckinsey-tagged, merged into Financial Inclusion)
+DETAIL_COLS = {"E": 0, "F": 0, "G": 1, "H": 2, "I": 3, "J": 4, "K": 5, "L": 6}
+# column pairs (USD, PKR) in the profit split sheet
+PROFIT_COLS = {0: [("C", "D"), ("E", "F")], 1: [("G", "H")], 2: [("I", "J")],
+               3: [("K", "L")], 4: [("M", "N")], 5: [("O", "P")], 6: [("Q", "R")]}
+FUND_TYPES = ["RDEL", "CDEL Debt", "CDEL Equity", "CDEL Strategic"]
+MONTHS = ["Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr", "May", "Jun"]
+MONTH_NAMES = ["July", "August", "September", "October", "November", "December",
+               "January", "February", "March", "April", "May", "June"]
+YEARS = [2026] * 6 + [2027] * 6
+DAYS = [31, 31, 30, 31, 30, 31, 31, 28, 31, 30, 31, 30]   # days used for profit (actual/360)
+
+
+def _num(v) -> float:
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0.0
+
+
+def _date(v):
+    if isinstance(v, dt.datetime):
+        return v.date()
+    if isinstance(v, dt.date):
+        return v
+    if isinstance(v, str):
+        for f in ("%d-%m-%y", "%d-%m-%Y", "%Y-%m-%d"):
+            try:
+                return dt.datetime.strptime(v.strip(), f).date()
+            except ValueError:
+                pass
+    return None
+
+
+def _fy(d: dt.date) -> str:
+    y = d.year if d.month >= 7 else d.year - 1
+    return f"{y}-{str(y + 1)[2:]}"
+
+
+def _sheet(wb, name: str):
+    for ws in wb.worksheets:
+        if ws.title.strip().lower() == name.strip().lower():
+            return ws
+    raise KeyError(f"Sheet '{name}' not found. Sheets: {[w.title for w in wb.worksheets]}")
+
+
+@dataclass
+class Data:
+    gf: pd.DataFrame
+    fc: pd.DataFrame
+    funds: pd.DataFrame                 # one row per programme
+    profit: pd.DataFrame                # one row per programme and month (Jul to Sep)
+    rates: list = field(default_factory=list)   # SBP monthly spot rates Jul to Sep
+    act_open: list = field(default_factory=list)   # USD-only balances, Jul to Sep
+    act_close: list = field(default_factory=list)
+    act_conv: list = field(default_factory=list)   # USD converted to PKR
+    act_eq: list = field(default_factory=list)     # equity injection
+    act_profit: list = field(default_factory=list) # total profit in US$ equivalent
+    start_balance: float = 0.0           # USD balance at 30 September
+    oct_equity: float = 0.0              # equity injection received in October
+    available_usd: float = 0.0           # USD balance at latest date (5 October)
+    pkr_balance: float = 0.0             # PKR balances at 30 September (Rs)
+    latest_fx: float = 0.0
+    default_rate: float = 0.0            # profit rate earned Jul to Sep (actual/360)
+    default_conv: float = 0.0            # average monthly USD converted to PKR
+    avg_balance: float = 0.0
+    as_of: str = ""
+
+
+def load(source) -> Data:
+    wb = openpyxl.load_workbook(source, data_only=True)
+
+    # ---- receipts ---------------------------------------------------------
+    gf, fc = [], []
+    for r in _sheet(wb, "EAGR & GF").iter_rows(values_only=True):
+        if len(r) < 11:
+            continue
+        donor, d = str(r[2] or "").strip(), _date(r[3])
+        if not d:
+            continue
+        if donor == "GF" and _num(r[6]):
+            i = PROG_MAP.get(str(r[4]).strip().lower())
+            if i is not None:
+                gf.append(dict(date=d, fy=_fy(d), programme=PROGRAMMES[i], code=CODES[i],
+                               usd=_num(r[6]), rate=_num(r[8]), pkr=_num(r[9])))
+        elif donor == "FCDO":
+            fc.append(dict(date=d, fy=_fy(d), fund_type=str(r[4]).strip(),
+                           partner=str(r[5] or "").strip(), gbp=_num(r[7]),
+                           rate=_num(r[8]), pkr=_num(r[10])))
+    gf = pd.DataFrame(gf).sort_values("date").reset_index(drop=True)
+    fc = pd.DataFrame(fc).sort_values("date").reset_index(drop=True)
+    gf["date"], fc["date"] = pd.to_datetime(gf["date"]), pd.to_datetime(fc["date"])
+
+    # ---- monthly balance blocks (26-27 Detailed) ---------------------------
+    ws = _sheet(wb, "26-27 Detailed")
+
+    def row7(r):
+        out = [0.0] * 7
+        for col, i in DETAIL_COLS.items():
+            out[i] += _num(ws[f"{col}{r}"].value)
+        return out
+
+    blocks, cur = [], None
+    for r in range(1, ws.max_row + 1):
+        lab = str(ws.cell(r, 3).value or "").strip()
+        if lab.startswith("Opening bank balances in PKR"):
+            cur = dict(conv=[0.0] * 7, eq=[0.0] * 7)
+            blocks.append(cur)
+        if cur is None or not lab:
+            continue
+        if lab.startswith("Opening bank balances in PKR"):
+            cur["pkr_open"] = row7(r)
+        elif lab.startswith("Opening bank balances in USD"):
+            cur["usd_open"] = row7(r)
+        elif lab.startswith("Opening short term investment TDR"):
+            cur["tdr_open"] = row7(r)
+        elif lab.startswith("Add: Equity Injection"):
+            cur["eq"] = row7(r)
+        elif lab.startswith("Less: Outflow from USD bank account"):
+            cur["conv"] = [a - b for a, b in zip(cur["conv"], row7(r))]   # outflows are negative
+        elif lab.startswith("Closing bank balances in PKR"):
+            cur["pkr_close"] = row7(r)
+        elif lab.startswith("Closing bank balances in USD"):
+            cur["usd_close"] = row7(r)
+            cur["as_of"] = lab.split(" as of ")[-1]
+        elif lab.startswith("Closing short term investment TDR"):
+            cur["tdr_close"] = row7(r)
+    blocks = blocks[:4]   # Jul, Aug, Sep, Oct (to 5 Oct)
+    need = ["pkr_open", "usd_open", "tdr_open", "pkr_close", "usd_close", "tdr_close"]
+    for b in blocks:
+        for k in need:
+            b.setdefault(k, [0.0] * 7)
+
+    usd_open = lambda b: sum(b["usd_open"]) + sum(b["tdr_open"])
+    usd_close = lambda b: sum(b["usd_close"]) + sum(b["tdr_close"])
+    funds = pd.DataFrame(dict(
+        programme=PROGRAMMES, code=CODES,
+        opening_usd=[blocks[0]["usd_open"][i] + blocks[0]["tdr_open"][i] for i in range(7)],
+        converted_usd=[sum(b["conv"][i] for b in blocks) for i in range(7)],
+        available_usd=[blocks[3]["usd_close"][i] + blocks[3]["tdr_close"][i] for i in range(7)],
+        pkr_balance=blocks[2]["pkr_close"]))
+
+    # ---- profit split (GF Profit - USD PKR Split 26-27) --------------------
+    ps = _sheet(wb, "GF Profit - USD PKR Split 26-27")
+    rates = [_num(ps[f"U{r}"].value) for r in (5, 6, 7)]
+    rows = []
+    for m, r in enumerate((5, 6, 7)):
+        for i, pairs in PROFIT_COLS.items():
+            usd = sum(_num(ps[f"{a}{r}"].value) for a, _ in pairs)
+            pkr = sum(_num(ps[f"{b}{r}"].value) for _, b in pairs)
+            rows.append(dict(month=m, month_name=MONTHS[m], programme=PROGRAMMES[i],
+                             usd=usd, pkr=pkr, pkr_usd=pkr / rates[m], total_usd=usd + pkr / rates[m]))
+    profit = pd.DataFrame(rows)
+
+    act_profit = [float(profit.loc[profit.month == m, "total_usd"].sum()) for m in range(3)]
+    act_open = [usd_open(blocks[m]) for m in range(3)]
+    act_close = [usd_close(blocks[m]) for m in range(3)]
+    avg_bal = sum(act_open[m] * DAYS[m] for m in range(3)) / 92
+    conv = [sum(blocks[m]["conv"]) for m in range(3)]
+    return Data(
+        gf=gf, fc=fc, funds=funds, profit=profit, rates=rates,
+        act_open=act_open, act_close=act_close, act_conv=conv,
+        act_eq=[sum(blocks[m]["eq"]) for m in range(3)], act_profit=act_profit,
+        start_balance=act_close[2], oct_equity=sum(blocks[3]["eq"]),
+        available_usd=usd_close(blocks[3]), pkr_balance=sum(blocks[2]["pkr_close"]),
+        latest_fx=float(gf["rate"].iloc[-1]),
+        default_rate=round(sum(act_profit) / avg_bal * 360 / 92 * 100, 1),
+        default_conv=round(sum(conv) / 3 / 25000) * 25000,
+        avg_balance=avg_bal, as_of=blocks[3].get("as_of", ""))
